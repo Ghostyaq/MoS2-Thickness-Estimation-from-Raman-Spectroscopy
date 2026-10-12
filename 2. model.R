@@ -1,0 +1,228 @@
+rm(list = ls())
+
+source("0. functions.R")
+
+# ----- SPECIFICATIONS -----
+
+set.seed(449)
+nboot <- 1000
+num_cores <- detectCores(logical = FALSE) - 1
+viz_scale <- 1
+mapping <- c("background" = 0, "monolayer" = 0.7, "bilayer" = 2.02, "bulk" = 4.00)
+
+training_data <- list.files(
+    path = "training_data", pattern = "\\.txt$", 
+    recursive = TRUE, full.names = TRUE
+)
+
+size <- 100
+large_area_scan <- "large_area_scans/100µm/300x300.txt"
+
+# ----- LOADING FILES ----- 
+
+spectra <- lapply(training_data, fread)
+raw <- fread(large_area_scan, header = FALSE)
+
+# ----- CLUSTER EXPORTS -----
+
+cl <- makeCluster(num_cores, type = "PSOCK")
+clusterEvalQ(cl, {
+    library(minpack.lm) 
+    library(tibble)
+    })
+clusterExport(cl, c("gaussian", "double_gaussian"))
+
+# ----- TRAINING MODELS ------
+results <- bind_rows(lapply(seq_along(training_data), function(i) {
+    process_spectrum(training_data[i], i, cl)
+}))
+
+labels <- as.factor(basename(dirname(training_data)))
+results$Layer <- labels
+results$thickness <- mapping[as.character(results$Layer)]
+
+feature_table <- results |>
+    dplyr::select(
+        Layer, thickness, x_axis1, x_axis2, diff_peak, intensity_ratio, 
+        mu1, mu2, fwhm1, fwhm2, A1, A2, area1, area2, area_ratio, snr, rmse,
+        r_squared, diff_fit
+    )
+
+scaled_features <- scale(feature_table[, -c(1, 2)])
+
+center <- attr(scaled_features,"scaled:center")
+scale  <- attr(scaled_features,"scaled:scale")
+
+scaled_features <- as.data.frame(scaled_features)
+scaled_features$Layer <- feature_table$Layer
+scaled_features$thickness <- feature_table$thickness
+
+lda_model <- lda(
+    Layer ~ mu1 + area_ratio + r_squared + diff_fit,
+    data = scaled_features
+)
+
+linear_model <- lm(
+    thickness ~ mu1 + mu2 + fwhm2 + area1 + area2 + area_ratio,
+    data = scaled_features
+    )
+
+X <- as.matrix(scaled_features[c(4, 7, 8, 12, 13, 14, 17)])
+y <- scaled_features$thickness
+ridge_cv_model <- cv.glmnet(X, y, alpha = 0)
+best_lambda <- ridge_cv_model$lambda.min
+ridge_model <- glmnet(X, y, alpha = 0, lambda = best_lambda)
+
+forest_model <- randomForest(
+    thickness ~ diff_peak + mu1 + mu2 + fwhm2 + A1 + area2,
+    data = scaled_features, ntree = 500, mtry = 2, importance = TRUE
+)
+
+svr_model <- svm(
+    thickness ~ x_axis2 + fwhm2 + snr,
+    data = scaled_features, type = "eps-regression", kernel = "radial"
+)
+
+plsr_model <- plsr(
+    thickness ~ mu2 + A2 + area1 + area_ratio + diff_fit,
+    data = scaled_features,
+    validation = "LOO",
+    scale = FALSE
+)
+
+nn_model <- nnet(
+    thickness ~ x_axis2 + diff_peak + fwhm2 + area1 + area2 + area_ratio + r_squared,
+    data = scaled_features, size = 3,  linout = TRUE, decay = 0.01, 
+    maxit = 1000, trace = TRUE
+)
+
+# ----- LARGE AREA SCAN PREDICTION -----
+
+raw[] <- lapply(raw, as.numeric)
+
+data <- normalize_data(raw)
+
+peak_summary <- find_peak_locations(data, cl)
+gaussian_results <- auto_gaussian_summary(data, peak_summary, cl)
+stopCluster(cl)
+
+peak_summary <- peak_summary |>
+    mutate(
+        diff_peak = abs(x_axis1 - x_axis2),
+        intensity_ratio = intensity1 / intensity2,
+    ) |>
+    merge(gaussian_results, by = "id")
+
+heatmap_df <- peak_summary |>
+    dplyr::mutate(
+        x = ((id - 1) %% size) + 1,
+        y = size - (((id - 1) %/% size) + 1) + 1
+        ) |>
+    dplyr::select(
+        id, x, y, x_axis1, x_axis2, diff_peak, mu1, mu2, diff_fit, 
+        intensity1, intensity2, intensity_ratio, A1, A2,  fwhm1, fwhm2, 
+        area1, area2, area_ratio, snr, rmse, r_squared)
+
+large_area_features <- heatmap_df |>
+    dplyr::select(
+        x_axis1, x_axis2, diff_peak, intensity_ratio, 
+        mu1, mu2, fwhm1, fwhm2, A1, A2, area1, area2, area_ratio, snr, rmse,
+        r_squared, diff_fit
+    )
+
+large_scaled <- scale(large_area_features, center = center, scale = scale)
+large_scaled_df <- as.data.frame(large_scaled)
+
+# ----- APPLYING MODELS -----
+
+lda_pred <- predict(lda_model, newdata = large_scaled_df |> select(mu1, area_ratio, r_squared, diff_fit))
+lm_pred <- predict(linear_model, newdata = large_scaled_df |> select(mu1, mu2, fwhm2, area1, area2, area_ratio))
+rr_pred <- predict(ridge_model, newdata = best_lambda, newx = large_scaled[, c(4, 7, 8, 12, 13, 14, 17)])
+rf_pred <- predict(forest_model, newdata = large_scaled_df |> select(diff_peak, mu1, mu2, fwhm2, A1, area2))
+vr_pred <- predict(svr_model, newdata = large_scaled_df |> select(x_axis2, fwhm2, snr))
+pl_pred <- predict(
+    plsr_model,  ncomp = 4,
+    newdata = large_scaled_df |> select(mu2, A2, area1, area_ratio, diff_fit)
+    )
+nn_pred <- predict(nn_model, newdata = large_scaled_df |> select(x_axis2, diff_peak, fwhm2, area1, area2, area_ratio, r_squared))
+boot_predictions <- matrix(NA, nrow = nrow(large_scaled[, c(4, 5, 8, 9, 10, 11, 12)]), ncol = nboot)
+
+# ----- BOOTSTRAPPED PREDICTIONS FOR PLSR -----
+
+set.seed(123)
+for (i in 1:nboot) {
+    back_features <- filter(scaled_features, Layer == "background")
+    mono_features <- filter(scaled_features, Layer == "monolayer")
+    bila_features <- filter(scaled_features, Layer == "bilayer")
+    bulk_features <- filter(scaled_features, Layer == "bulk")
+    
+    boot_index_back <- sample(seq_len(nrow(back_features)), replace = TRUE)
+    boot_index_mono <- sample(seq_len(nrow(mono_features)), replace = TRUE)
+    boot_index_bila <- sample(seq_len(nrow(bila_features)), replace = TRUE)
+    boot_index_bulk <- sample(seq_len(nrow(bulk_features)), replace = TRUE)
+    
+    boot_train_back <- back_features[boot_index_back, ]
+    boot_train_mono <- mono_features[boot_index_mono, ]
+    boot_train_bila <- bila_features[boot_index_bila, ]
+    boot_train_bulk <- bulk_features[boot_index_bulk, ]
+    boot_train <- rbind(
+        boot_train_back, boot_train_mono, 
+        boot_train_bila, boot_train_bulk
+        )
+    
+    model <- plsr(
+        thickness ~ mu2 + A2 + area1 + area_ratio + diff_fit, 
+        data = boot_train, validation = "none", scale = FALSE, ncomp = 4
+    )
+    
+    boot_predictions[, i] <- as.vector(
+        predict(
+            model, 
+            newdata = as.data.frame(large_scaled) |> 
+                select(mu2, A2, area1, area_ratio, diff_fit), 
+            ncomp = 4
+            ))
+}
+
+mean_prediction <- rowMeans(boot_predictions)
+sd_prediction <- apply(boot_predictions, 1, sd)
+lower95 <- apply(boot_predictions, 1, quantile, probs = 0.025)
+upper95 <- apply(boot_predictions, 1, quantile, probs = 0.975)
+
+large_area_features$cluster_lda <- lda_pred$class
+large_area_features$thickness_lda <- mapping[as.character(lda_pred$class)] * viz_scale 
+large_area_features$thickness_lm <- as.numeric(lm_pred) * viz_scale
+large_area_features$thickness_rr <- as.numeric(as.vector(rr_pred)) * viz_scale
+large_area_features$thickness_rf <- rf_pred * viz_scale
+large_area_features$thickness_vr <- as.numeric(vr_pred) * viz_scale
+large_area_features$thickness_pl <- as.numeric(pl_pred) * viz_scale
+large_area_features$thickness_nn <- as.numeric(nn_pred) * viz_scale
+large_area_features$mean_thickness <- mean_prediction * viz_scale
+large_area_features$uncertainty <- sd_prediction * viz_scale
+large_area_features$lower95 <- lower95 * viz_scale
+large_area_features$upper95 <- upper95 * viz_scale
+large_area_features$x <- heatmap_df$x
+large_area_features$y <- heatmap_df$y
+large_area_features <- large_area_features |>
+    mutate(
+        height = (
+            thickness_lda + thickness_lm + thickness_rr + 
+            thickness_rf + thickness_rf + thickness_pl + thickness_nn
+            ) / 7
+    )
+
+# ----- GRAPHING -----
+
+source("1. graphs.R")
+
+ggplotly(lm_p)
+ggplotly(lda_p)
+ggplotly(rr_p)
+ggplotly(rf_p)
+ggplotly(vr_p)
+ggplotly(pl_p)
+ggplotly(nn_p)
+ggplotly(p)
+
+write_csv(large_area_features, file = "CSVs/analysis_results.csv")
+write_csv(scaled_features, file = "CSVs/scaled_features.csv")
